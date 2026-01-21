@@ -1,23 +1,20 @@
 import json
+import re
 import streamlit as st
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
-# ------------------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 
 SERVING_ENDPOINT_NAME = "databricks-claude-sonnet-4"
 
-# Hardcoded job catalog (SAFE starting point)
+# Replace with REAL job IDs
 JOB_CATALOG = {
-    "daily sales etl": {
-        "job_name": "daily_sales_etl",
-        "job_id": 123456789012345  # <-- replace with real job ID
-    },
-    "inventory etl": {
-        "job_name": "inventory_etl",
-        "job_id": 987654321098765
+    "test db job": {
+        "job_name": "Test_DB_Job1",
+        "job_id": 1234567890
     }
 }
 
@@ -32,23 +29,24 @@ You are a Databricks AI Agent.
 Known Databricks jobs:
 {chr(10).join([f"- {k} → job_name: {v['job_name']}" for k, v in JOB_CATALOG.items()])}
 
-If the user asks to run one of these jobs, respond ONLY with JSON.
+When a user requests a job:
+- Return a JSON object describing the plan
+- Do NOT explain execution status
+- Do NOT say "dry run" in natural language
 
 JSON format:
 {{
   "action": "run_databricks_job",
   "arguments": {{
     "job_name": "<job_name>",
-    "parameters": {{ ... }}
+    "parameters": {{ }}
   }}
 }}
 
 Rules:
-- Do NOT invent job names
-- If the job is not listed, ask for clarification
-- If information is missing, ask a question
-- Do NOT execute anything
-This is DRY-RUN mode only.
+- Never invent job names
+- Ask questions if information is missing
+- Never execute anything
 """
 
 ROLE_MAP = {
@@ -58,9 +56,18 @@ ROLE_MAP = {
 
 w = WorkspaceClient()
 
-# ------------------------------------------------------------------------------
-# Agent Call
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
+
+def extract_json(text: str):
+    """Extract first JSON object from text"""
+    match = re.search(r"\{[\s\S]*\}", text)
+    return match.group(0) if match else None
+
+# ==============================================================================
+# AGENT CALL
+# ==============================================================================
 
 def call_agent(messages):
     sdk_messages = [
@@ -82,16 +89,15 @@ def call_agent(messages):
     response = w.serving_endpoints.query(
         name=SERVING_ENDPOINT_NAME,
         messages=sdk_messages,
-        temperature=0.2,
+        temperature=0.1,
         max_tokens=500
     )
 
     return response.choices[0].message.content
 
-
-# ------------------------------------------------------------------------------
-# Execution (GATED)
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# EXECUTION (GATED)
+# ==============================================================================
 
 def execute_databricks_job(args):
     job_name = args["job_name"]
@@ -104,27 +110,20 @@ def execute_databricks_job(args):
         notebook_params=parameters
     )
 
-    return f"✅ Job `{job_name}` started successfully.\nRun ID: `{run.run_id}`"
-
+    return f"🚀 Job `{job_name}` started\nRun ID: `{run.run_id}`"
 
 def execute_plan(plan):
-    action = plan["action"]
-    args = plan["arguments"]
+    if plan["action"] == "run_databricks_job":
+        return execute_databricks_job(plan["arguments"])
+    raise ValueError("Unknown action")
 
-    if action == "run_databricks_job":
-        return execute_databricks_job(args)
-
-    else:
-        raise ValueError(f"Unknown action: {action}")
-
-
-# ------------------------------------------------------------------------------
-# Streamlit UI
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# STREAMLIT UI
+# ==============================================================================
 
 st.set_page_config(page_title="Databricks AI Agent", layout="centered")
 st.title("🤖 Databricks AI Agent")
-st.warning("🧪 Dry-Run Mode Enabled — actions require approval")
+st.warning("🧪 Dry-Run first → Approval required to execute")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -132,13 +131,19 @@ if "messages" not in st.session_state:
 if "pending_plan" not in st.session_state:
     st.session_state.pending_plan = None
 
-# Display chat history
+# ------------------------------------------------------------------------------
+# Chat history
+# ------------------------------------------------------------------------------
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+# ------------------------------------------------------------------------------
 # User input
-user_input = st.chat_input("Ask me to run a job or ask a question")
+# ------------------------------------------------------------------------------
+
+user_input = st.chat_input("Ask me to run a Databricks job")
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -150,30 +155,37 @@ if user_input:
         with st.spinner("Thinking..."):
             reply = call_agent(st.session_state.messages)
 
-            # Attempt JSON dry-run parsing
-            try:
-                plan = json.loads(reply)
+            json_text = extract_json(reply)
 
-                st.session_state.pending_plan = plan
+            if json_text:
+                try:
+                    plan = json.loads(json_text)
 
-                dry_run_md = (
-                    "### 🧪 Dry-Run Plan\n\n"
-                    f"**Action:** `{plan['action']}`\n\n"
-                    "**Arguments:**\n"
-                    "```json\n"
-                    f"{json.dumps(plan['arguments'], indent=2)}\n"
-                    "```\n\n"
-                    "⚠️ **Nothing has been executed yet.**"
-                )
+                    st.session_state.pending_plan = plan
 
-                st.markdown(dry_run_md)
+                    dry_run_md = (
+                        "### 🧪 Dry-Run Plan\n\n"
+                        f"**Action:** `{plan['action']}`\n\n"
+                        "**Arguments:**\n"
+                        "```json\n"
+                        f"{json.dumps(plan['arguments'], indent=2)}\n"
+                        "```\n\n"
+                        "⚠️ **Waiting for approval**"
+                    )
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": dry_run_md
-                })
+                    st.markdown(dry_run_md)
 
-            except json.JSONDecodeError:
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": dry_run_md
+                    })
+
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Failed to parse plan: {e}")
+                    st.markdown(reply)
+            else:
                 st.markdown(reply)
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -181,28 +193,36 @@ if user_input:
                 })
 
 # ------------------------------------------------------------------------------
-# Approval Controls
+# APPROVAL CONTROLS (TOP-LEVEL)
 # ------------------------------------------------------------------------------
 
 if st.session_state.pending_plan:
     st.divider()
-    st.warning("⚠️ Approving will execute this action in Databricks.")
+    st.warning("⚠️ Approving will execute this Databricks job")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        approve = st.button("✅ Approve")
+        approve = st.button("✅ Approve", key="approve")
 
     with col2:
-        cancel = st.button("❌ Cancel")
+        cancel = st.button("❌ Cancel", key="cancel")
 
     if cancel:
         st.session_state.pending_plan = None
-        st.success("Action canceled. Nothing was executed.")
+        st.success("Action canceled")
+        st.rerun()
 
     if approve:
-        with st.spinner("Executing..."):
+        with st.spinner("Executing job..."):
             result = execute_plan(st.session_state.pending_plan)
 
         st.session_state.pending_plan = None
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": f"🚀 **Execution confirmed**\n\n{result}"
+        })
+
         st.success(result)
+        st.rerun()
